@@ -16,7 +16,8 @@ from selenium.webdriver.chrome.webdriver import WebDriver
 
 from src import RemainingSearches
 from src.userAgentGenerator import GenerateUserAgent
-from src.utils import CONFIG, Utils, getBrowserConfig, getProjectRoot, saveBrowserConfig
+from src.utils import (CONFIG, Utils, getBrowserConfig, getProjectRoot,
+                       saveBrowserConfig)
 
 
 class Browser:
@@ -98,6 +99,9 @@ class Browser:
         options.add_argument("--disable-http2")
         options.add_argument("--disable-search-engine-choice-screen")  # 153
         options.page_load_strategy = "eager"
+
+        # Add this line for private/incognito mode
+        options.add_argument("--incognito")
 
         seleniumwireOptions: dict[str, Any] = {"verify_ssl": False}
 

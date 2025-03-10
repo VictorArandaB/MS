@@ -1,19 +1,18 @@
 import argparse
 import contextlib
 import logging
+import time
 from argparse import Namespace
 
 from pyotp import TOTP
 from selenium.common import TimeoutException
-from selenium.common.exceptions import (
-    ElementNotInteractableException,
-    NoSuchElementException,
-)
+from selenium.common.exceptions import (ElementNotInteractableException,
+                                        NoSuchElementException)
 from selenium.webdriver.common.by import By
 from undetected_chromedriver import Chrome
 
 from src.browser import Browser
-from src.utils import sendNotification, CONFIG
+from src.utils import CONFIG, sendNotification
 
 
 class Login:
@@ -86,117 +85,124 @@ class Login:
         assert emailField.get_attribute("value") == self.browser.email
         self.utils.waitUntilClickable(By.ID, "idSIButton9").click()
 
-        # Passwordless check
-        isPasswordless = False
-        with contextlib.suppress(TimeoutException):
-            self.utils.waitUntilVisible(By.ID, "displaySign")
-            isPasswordless = True
-        logging.debug("isPasswordless = %s", isPasswordless)
+        # Password-based login, enter password from accounts.json
+        passwordField = self.utils.waitUntilClickable(By.NAME, "passwd")
+        logging.info("[LOGIN] Entering password...")
+        passwordField.click()
+        passwordField.send_keys(self.browser.password)
+        assert passwordField.get_attribute("value") == self.browser.password
+        self.utils.waitUntilClickable(By.ID, "idSIButton9").click()
 
-        if isPasswordless:
-            # Passworless login, have user confirm code on phone
-            codeField = self.utils.waitUntilVisible(By.ID, "displaySign")
-            logging.warning(
-                "[LOGIN] Confirm your login with code %s on your phone (you have one minute)!\a",
-                codeField.text,
+        # Add a small delay to let the page load
+        time.sleep(3)
+        
+        # Check for TOTP screen using multiple possible element identifiers
+        isTOTPEnabled = False
+        otpField = None
+        
+        # Debug: Take a screenshot before TOTP detection
+        self.webdriver.save_screenshot("pre_totp_check.png")
+        
+        # Try different possible TOTP input field identifiers
+        potential_otp_fields = [
+            "idTxtBx_SAOTCC_OTC",  # Original one
+            "otc",                 # Possible simplified ID
+            "idOTC",               # Another possible ID
+            "idTOTP"               # Another possible ID
+        ]
+        
+        # Try to find input fields by type and pattern
+        try:
+            # Use XPath to find any input field that looks like a TOTP field
+            otpField = self.webdriver.find_element(
+                By.XPATH, "//input[@type='tel' or @inputmode='numeric' or @pattern='[0-9]*']"
             )
-            if CONFIG.get("apprise.notify.login-code"):
-                sendNotification(
-                    f"Confirm your login on your phone", f"Code: {codeField.text} (expires in 1 minute)")
-            self.utils.waitUntilVisible(By.NAME, "kmsiForm", 60)
-            logging.info("[LOGIN] Successfully verified!")
-        else:
-            # Password-based login, enter password from accounts.json
-            passwordField = self.utils.waitUntilClickable(By.NAME, "passwd")
-            logging.info("[LOGIN] Entering password...")
-            passwordField.click()
-            passwordField.send_keys(self.browser.password)
-            assert passwordField.get_attribute("value") == self.browser.password
-            self.utils.waitUntilClickable(By.ID, "idSIButton9").click()
-
-            # Check if 2FA is enabled, both device auth and TOTP are supported
-            isDeviceAuthEnabled = False
-            with contextlib.suppress(TimeoutException):
-                self.utils.waitUntilVisible(By.ID, "idSpan_SAOTCAS_DescSessionID")
-                isDeviceAuthEnabled = True
-            logging.debug("isDeviceAuthEnabled = %s", isDeviceAuthEnabled)
-
-            isTOTPEnabled = False
-            with contextlib.suppress(TimeoutException):
-                self.utils.waitUntilVisible(By.ID, "idTxtBx_SAOTCC_OTC", 1)
+            if otpField:
                 isTOTPEnabled = True
-            logging.debug("isTOTPEnabled = %s", isTOTPEnabled)
-
-            if isDeviceAuthEnabled:
-                # Device-based authentication not supported
-                raise Exception(
-                    "Device authentication not supported. Please use TOTP or disable 2FA."
-                )
-
-                # Device auth, have user confirm code on phone
-                codeField = self.utils.waitUntilVisible(
-                    By.ID, "idSpan_SAOTCAS_DescSessionID"
-                )
-                logging.warning(
-                    "[LOGIN] Confirm your login with code %s on your phone (you have"
-                    " one minute)!\a",
-                    codeField.text,
-                )
-                if CONFIG.get("apprise.notify.login-code"):
-                    sendNotification(
-                        f"Confirm your login on your phone", f"Code: {codeField.text} (expires in 1 minute)")
-                self.utils.waitUntilVisible(By.NAME, "kmsiForm", 60)
-                logging.info("[LOGIN] Successfully verified!")
-
-            elif isTOTPEnabled:
-                # One-time password required
-                if self.browser.totp is not None:
-                    # TOTP token provided
-                    logging.info("[LOGIN] Entering OTP...")
-                    otp = TOTP(self.browser.totp.replace(" ", "")).now()
-                    otpField = self.utils.waitUntilClickable(
-                        By.ID, "idTxtBx_SAOTCC_OTC"
-                    )
-                    otpField.send_keys(otp)
-                    assert otpField.get_attribute("value") == otp
-                    self.utils.waitUntilClickable(
-                        By.ID, "idSubmit_SAOTCC_Continue"
-                    ).click()
-                else:
-                    # TOTP token not provided, manual intervention required
-                    assert CONFIG.browser.visible, (
-                        "[LOGIN] 2FA detected, provide token in accounts.json or or run in"
-                        "[LOGIN] 2FA detected, provide token in accounts.json or handle manually."
-                        " visible mode to handle login."
-                    )
-                    print(
-                        "[LOGIN] 2FA detected, handle prompts and press enter when on"
-                        " keep me signed in page."
-                    )
-                    input()
-
-        self.check_locked_user()
-        self.check_banned_user()
-
-        self.utils.waitUntilVisible(By.NAME, "kmsiForm")
-        self.utils.waitUntilClickable(By.ID, "acceptButton").click()
-
-        # TODO: This should probably instead be checked with an element's id,
-        # as the hardcoded text might be different in other languages
-        isAskingToProtect = self.utils.checkIfTextPresentAfterDelay(
-            "protect your account", 5
-        )
-        logging.debug("isAskingToProtect = %s", isAskingToProtect)
-
-        if isAskingToProtect:
-            assert (
-                CONFIG.browser.visible
-            ), "Account protection detected, run in visible mode to handle login"
-            print(
-                "Account protection detected, handle prompts and press enter when on rewards page"
-            )
-            input()
-
-        self.utils.waitUntilVisible(
-            By.CSS_SELECTOR, 'html[data-role-name="RewardsPortal"]'
-        )
+                logging.info("[LOGIN] TOTP field detected by input attributes")
+        except NoSuchElementException:
+            # Try the specific IDs
+            for field_id in potential_otp_fields:
+                try:
+                    otpField = self.webdriver.find_element(By.ID, field_id)
+                    isTOTPEnabled = True
+                    logging.info(f"[LOGIN] TOTP field detected with ID: {field_id}")
+                    break
+                except NoSuchElementException:
+                    continue
+        
+        # If still not found, check if page contains OTP-related text
+        if not isTOTPEnabled:
+            page_source = self.webdriver.page_source.lower()
+            otp_indicators = [
+                "one-time code", 
+                "verification code",
+                "security code",
+                "authenticator",
+                "two-factor",
+                "2fa",
+                "otp"
+            ]
+            for indicator in otp_indicators:
+                if indicator in page_source:
+                    logging.info(f"[LOGIN] TOTP likely required (detected text: '{indicator}')")
+                    
+                    # Take a screenshot to help debug
+                    self.webdriver.save_screenshot("totp_screen.png")
+                    
+                    # Try to find any input field
+                    try:
+                        otpField = self.webdriver.find_element(By.XPATH, "//input")
+                        isTOTPEnabled = True
+                        logging.info("[LOGIN] Found potential TOTP field")
+                        break
+                    except NoSuchElementException:
+                        continue
+        
+        if isTOTPEnabled and otpField:
+            # One-time password required
+            if self.browser.totp is not None:
+                # TOTP token provided
+                logging.info("[LOGIN] Entering OTP...")
+                otp = TOTP(self.browser.totp.replace(" ", "")).now()
+                
+                # Clear the field first (sometimes necessary)
+                otpField.clear()
+                # Send the OTP code
+                otpField.send_keys(otp)
+                logging.info(f"[LOGIN] Entered OTP code: {otp}")
+                
+                # Take a screenshot after entering the OTP
+                self.webdriver.save_screenshot("after_otp_entry.png")
+                
+                # Find and click the submit button
+                submit_buttons = [
+                    "idSubmit_SAOTCC_Continue",
+                    "idSubmit_Continue",
+                    "idSIButton9"
+                ]
+                
+                submit_clicked = False
+                for button_id in submit_buttons:
+                    try:
+                        submit_button = self.webdriver.find_element(By.ID, button_id)
+                        submit_button.click()
+                        logging.info(f"[LOGIN] Clicked OTP submit button with ID: {button_id}")
+                        submit_clicked = True
+                        break
+                    except NoSuchElementException:
+                        continue
+                
+                # If no specific button found, try any button
+                if not submit_clicked:
+                    try:
+                        submit_button = self.webdriver.find_element(By.XPATH, "//button[@type='submit']")
+                        submit_button.click()
+                        logging.info("[LOGIN] Clicked generic submit button")
+                        submit_clicked = True
+                    except NoSuchElementException:
+                        logging.warning("[LOGIN] Could not find OTP submit button")
+                
+                # Wait for the next page
+                time.sleep(5)
+                self.webdriver.save_screenshot("post_otp_submission.png")
