@@ -100,9 +100,6 @@ class Login:
         isTOTPEnabled = False
         otpField = None
         
-        # Debug: Take a screenshot before TOTP detection
-        self.webdriver.save_screenshot("pre_totp_check.png")
-        
         # Try different possible TOTP input field identifiers
         potential_otp_fields = [
             "idTxtBx_SAOTCC_OTC",  # Original one
@@ -147,8 +144,6 @@ class Login:
                 if indicator in page_source:
                     logging.info(f"[LOGIN] TOTP likely required (detected text: '{indicator}')")
                     
-                    # Take a screenshot to help debug
-                    self.webdriver.save_screenshot("totp_screen.png")
                     
                     # Try to find any input field
                     try:
@@ -171,9 +166,7 @@ class Login:
                 # Send the OTP code
                 otpField.send_keys(otp)
                 logging.info(f"[LOGIN] Entered OTP code: {otp}")
-                
-                # Take a screenshot after entering the OTP
-                self.webdriver.save_screenshot("after_otp_entry.png")
+
                 
                 # Find and click the submit button
                 submit_buttons = [
@@ -205,4 +198,3 @@ class Login:
                 
                 # Wait for the next page
                 time.sleep(5)
-                self.webdriver.save_screenshot("post_otp_submission.png")

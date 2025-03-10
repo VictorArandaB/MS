@@ -2,18 +2,21 @@ import dbm.dumb
 import json
 import logging
 import shelve
+import time as time_module
 from datetime import date, timedelta
 from enum import Enum, auto
 from itertools import cycle
-from random import random, randint, shuffle
-from time import sleep
+from random import randint, random, shuffle
+from time import sleep, time
 from typing import Final
 
 import requests
+from selenium.common.exceptions import NoSuchElementException, TimeoutException
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 
 from src.browser import Browser
-from src.utils import CONFIG, makeRequestsSession, getProjectRoot
+from src.utils import CONFIG, getProjectRoot, makeRequestsSession
 
 
 class RetriesStrategy(Enum):
@@ -146,89 +149,239 @@ class Searches:
             f"[BING] Starting {self.browser.browserType.capitalize()} Edge Bing searches..."
         )
 
-        self.browser.utils.goToSearch()
+        # Reset browser state before starting searches
+        try:
+            self.browser.utils.goToSearch()
+            time_module.sleep(5)  # Give the page time to load
+            
+            # Clear cookies and cache periodically (once at the beginning)
+            try:
+                self.webdriver.execute_script('window.localStorage.clear();')
+                self.webdriver.execute_script('window.sessionStorage.clear();')
+                logging.info("[BING] Cleared browser storage")
+            except Exception as e:
+                logging.debug(f"[BING] Failed to clear storage: {e}")
+        except Exception as e:
+            logging.error(f"[BING] Failed to navigate to search page: {e}")
+            return
+
+        # Track overall search success
+        success_count = 0
+        fail_count = 0
+        max_fails = 5  # Maximum consecutive failures before giving up
 
         while True:
-            desktopAndMobileRemaining = self.browser.getRemainingSearches(
-                desktopAndMobile=True
-            )
-            logging.info(f"[BING] Remaining searches={desktopAndMobileRemaining}")
-            if (
-                self.browser.browserType == "desktop"
-                and desktopAndMobileRemaining.desktop == 0
-            ) or (
-                self.browser.browserType == "mobile"
-                and desktopAndMobileRemaining.mobile == 0
-            ):
-                break
-
-            if desktopAndMobileRemaining.getTotal() > len(self.googleTrendsShelf):
-                # self.googleTrendsShelf.clear()  # Maybe needed?
-                logging.debug(
-                    f"google_trends before load = {list(self.googleTrendsShelf.items())}"
+            try:
+                desktopAndMobileRemaining = self.browser.getRemainingSearches(
+                    desktopAndMobile=True
                 )
-                trends = self.getGoogleTrends(desktopAndMobileRemaining.getTotal())
-                shuffle(trends)
-                for trend in trends:
-                    self.googleTrendsShelf[trend] = None
-                logging.debug(
-                    f"google_trends after load = {list(self.googleTrendsShelf.items())}"
-                )
+                logging.info(f"[BING] Remaining searches={desktopAndMobileRemaining}")
+                
+                if (
+                    self.browser.browserType == "desktop"
+                    and desktopAndMobileRemaining.desktop == 0
+                ) or (
+                    self.browser.browserType == "mobile"
+                    and desktopAndMobileRemaining.mobile == 0
+                ):
+                    break
 
-            self.bingSearch()
-            del self.googleTrendsShelf[list(self.googleTrendsShelf.keys())[0]]
-            sleep(randint(10, 15))
+                if fail_count >= max_fails:
+                    logging.error(f"[BING] Reached maximum consecutive failures ({max_fails}). Stopping searches.")
+                    break
+
+                if desktopAndMobileRemaining.getTotal() > len(self.googleTrendsShelf):
+                    logging.debug(
+                        f"google_trends before load = {list(self.googleTrendsShelf.items())}"
+                    )
+                    trends = self.getGoogleTrends(desktopAndMobileRemaining.getTotal())
+                    shuffle(trends)
+                    for trend in trends:
+                        self.googleTrendsShelf[trend] = None
+                    logging.debug(
+                        f"google_trends after load = {list(self.googleTrendsShelf.items())}"
+                    )
+
+                # Try to perform a search
+                search_result = self.bingSearch()
+                
+                if search_result:
+                    success_count += 1
+                    fail_count = 0  # Reset fail counter on success
+                    
+                    # After successful searches, remove the term from shelf
+                    if list(self.googleTrendsShelf.keys()):
+                        del self.googleTrendsShelf[list(self.googleTrendsShelf.keys())[0]]
+                    
+                    # Add longer delay between successful searches
+                    delay = randint(15, 30) + random() * 10
+                    logging.info(f"[BING] Search successful. Waiting {int(delay)} seconds before next search.")
+                    sleep(delay)
+                else:
+                    fail_count += 1
+                    logging.warning(f"[BING] Search failed. Consecutive failures: {fail_count}/{max_fails}")
+                    
+                    # If multiple failures, try some recovery actions
+                    if fail_count >= 3:
+                        try:
+                            logging.info("[BING] Attempting recovery actions...")
+                            # Clear cookies
+                            self.webdriver.delete_all_cookies()
+                            time_module.sleep(2)
+                            
+                            # Navigate to Bing homepage again
+                            self.browser.utils.goToSearch()
+                            time_module.sleep(10)
+                            
+                            # Check if we need to log in again
+                            if not self.browser.utils.isLoggedIn():
+                                logging.warning("[BING] Session lost, need to log in again")
+                                # You might want to add code to log in again here
+                                return
+                        except Exception as e:
+                            logging.error(f"[BING] Recovery action failed: {e}")
+                    
+                    # Add increasing delay between failed searches
+                    delay = 30 + (30 * fail_count) + (random() * 30)
+                    logging.info(f"[BING] Waiting {int(delay)} seconds before retry.")
+                    sleep(delay)
+            
+            except Exception as e:
+                logging.error(f"[BING] Unexpected error during search loop: {e}")
+                fail_count += 1
+                sleep(randint(20, 40))
 
         logging.info(
-            f"[BING] Finished {self.browser.browserType.capitalize()} Edge Bing searches !"
+            f"[BING] Finished {self.browser.browserType.capitalize()} Edge Bing searches! "
+            f"Completed {success_count} searches successfully."
         )
 
-    def bingSearch(self) -> None:
-        # Function to perform a single Bing search
-        pointsBefore = self.browser.utils.getAccountPoints()
+    def bingSearch(self) -> bool:
+        """Perform a single Bing search. Returns True if successful, False otherwise."""
+        try:
+            pointsBefore = self.browser.utils.getAccountPoints()
+            
+            # Initialize tracking for consecutive failures
+            if not hasattr(self, 'consecutive_failures'):
+                self.consecutive_failures = 0
+            if not hasattr(self, 'max_wait'):
+                self.max_wait = 120  # Maximum wait time in seconds
 
-        rootTerm = list(self.googleTrendsShelf.keys())[0]
-        terms = self.getRelatedTerms(rootTerm)
-        logging.debug(f"terms={terms}")
-        termsCycle: cycle[str] = cycle(terms)
-        baseDelay = Searches.baseDelay
-        logging.debug(f"rootTerm={rootTerm}")
+            # Get search terms
+            if not list(self.googleTrendsShelf.keys()):
+                logging.error("[BING] No search terms available")
+                return False
+                
+            rootTerm = list(self.googleTrendsShelf.keys())[0]
+            terms = self.getRelatedTerms(rootTerm)
+            if not terms:
+                terms = [rootTerm]  # Fallback to root term if no related terms
+            
+            logging.debug(f"terms={terms}")
+            termsCycle = cycle(terms)
+            baseDelay = Searches.baseDelay
+            logging.debug(f"rootTerm={rootTerm}")
 
-        # todo If first 3 searches of day, don't retry since points register differently, will be a bit quicker
-        for i in range(self.maxRetries + 1):
-            if i != 0:
-                sleepTime: float
-                if Searches.retriesStrategy == Searches.retriesStrategy.EXPONENTIAL:
-                    sleepTime = baseDelay * 2 ** (i - 1)
-                elif Searches.retriesStrategy == Searches.retriesStrategy.CONSTANT:
-                    sleepTime = baseDelay
-                else:
-                    raise AssertionError
-                sleepTime += baseDelay * random()  # Add jitter
-                logging.debug(
-                    f"[BING] Search attempt not counted {i}/{Searches.maxRetries}, sleeping {sleepTime}"
-                    f" seconds..."
-                )
-                sleep(sleepTime)
+            # Add randomized initial delay
+            time_module.sleep(randint(5, 10) + random() * 3)
+            
+            # Attempt the search
+            for i in range(min(self.maxRetries + 1, 3)):  # Limit retries to avoid excessive loops
+                if i != 0:
+                    sleepTime = baseDelay * (1 + random()) if i == 1 else baseDelay * 2 * (1 + random())
+                    logging.debug(f"[BING] Search attempt {i+1}, sleeping {sleepTime:.1f} seconds...")
+                    sleep(sleepTime)
 
-            searchbar = self.browser.utils.waitUntilClickable(
-                By.ID, "sb_form_q", timeToWait=40
-            )
-            searchbar.clear()
-            term = next(termsCycle)
-            logging.debug(f"term={term}")
-            sleep(1)
-            searchbar.send_keys(term)
-            sleep(1)
-            searchbar.submit()
-
-            pointsAfter = self.browser.utils.getAccountPoints()
-            if pointsBefore < pointsAfter:
-                sleep(randint(CONFIG.cooldown.min, CONFIG.cooldown.max))
-                return
-
-            # todo
-            # if i == (maxRetries / 2):
-            #     logging.info("[BING] " + "TIMED OUT GETTING NEW PROXY")
-            #     self.webdriver.proxy = self.browser.giveMeProxy()
-        logging.error("[BING] Reached max search attempt retries")
+                try:
+                    # Make sure we're on the search page
+                    current_url = self.webdriver.current_url
+                    if "bing.com" not in current_url or "search" not in current_url.lower():
+                        logging.info("[BING] Navigating to search page")
+                        self.browser.utils.goToSearch()
+                        time_module.sleep(5)
+                    
+                    # Find and interact with the search box
+                    try:
+                        searchbar = self.browser.utils.waitUntilClickable(By.ID, "sb_form_q", timeToWait=20)
+                    except TimeoutException:
+                        # Try alternative selectors if the main one fails
+                        try:
+                            searchbar = self.webdriver.find_element(By.NAME, "q")
+                        except:
+                            try:
+                                searchbar = self.webdriver.find_element(By.XPATH, "//input[@type='search']")
+                            except:
+                                logging.error("[BING] Could not find search bar")
+                                return False
+                    
+                    # Clear the search box
+                    searchbar.clear()
+                    time_module.sleep(random() * 1.5)
+                    
+                    # Get the next search term
+                    term = next(termsCycle)
+                    logging.info(f"[BING] Searching for: {term}")
+                    
+                    # Type the term with human-like delays
+                    for char in term:
+                        searchbar.send_keys(char)
+                        time_module.sleep(0.05 + random() * 0.15)
+                    
+                    # Short pause before submitting
+                    time_module.sleep(0.5 + random())
+                    
+                    # Submit the search
+                    try:
+                        searchbar.submit()
+                    except:
+                        # Alternative: press Enter
+                        searchbar.send_keys(Keys.RETURN)
+                    
+                    # Wait for results to load
+                    time_module.sleep(5 + random() * 3)
+                    
+                    # Check for error page
+                    page_source = self.webdriver.page_source.lower()
+                    if any(phrase in page_source for phrase in [
+                        "it's not you, it's us", 
+                        "isn't available right now",
+                        "something went wrong",
+                        "this page isn't available"
+                    ]):
+                        self.consecutive_failures += 1
+                        wait_time = min(30 * (2 ** self.consecutive_failures), self.max_wait)
+                        logging.warning(f"[BING] Received Bing error page, waiting {wait_time} seconds")
+                        time_module.sleep(wait_time)
+                        continue  # Try next attempt
+                    
+                    # Check if points were awarded
+                    time_module.sleep(3)  # Allow time for points to register
+                    pointsAfter = self.browser.utils.getAccountPoints()
+                    
+                    if pointsAfter > pointsBefore:
+                        # Success!
+                        self.consecutive_failures = 0
+                        logging.debug(f"[BING] Search successful! Points: {pointsBefore} -> {pointsAfter}")
+                        return True
+                    else:
+                        # Wait a bit longer and check again
+                        time_module.sleep(randint(5, 10))
+                        pointsAfterRetry = self.browser.utils.getAccountPoints()
+                        
+                        if pointsAfterRetry > pointsBefore:
+                            self.consecutive_failures = 0
+                            logging.debug(f"[BING] Search successful on retry! Points: {pointsBefore} -> {pointsAfterRetry}")
+                            return True
+                        
+                        logging.debug("[BING] No points awarded for this search")
+                
+                except Exception as e:
+                    logging.error(f"[BING] Error during search attempt {i+1}: {str(e)}")
+                    time_module.sleep(randint(5, 15))
+            
+            # If we get here, all attempts failed
+            return False
+            
+        except Exception as e:
+            logging.error(f"[BING] Unhandled exception in bingSearch: {str(e)}")
+            return False
